@@ -1,0 +1,263 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Linux CloudWatch - install on ASG Launch, custom config /var/log/messages to cloudwatch
+Parameters: 
+  AutoScalingGroupNames: 
+    Description: 
+      'Comma Delimited list of ASG to monitor for launch events. Expected format: my_asg1,my_asg2,myasg3,...'
+    Type: CommaDelimitedList
+    Default: test_asg
+  Prefix:
+    Description: Prefix for organizing log groups
+    Type: String
+    AllowedValues: 
+      - dev
+      - test
+      - prod
+  Region: 
+    Description: Region agent will be deployed in
+    Type: String
+    Default: us-east-1
+    AllowedValues: 
+      - us-east-1   
+      - us-central-2 
+  SSMDocName: 
+    Type: String
+    Description: Sets SSM Document and SSM Parameter name
+    ConstraintDescription:
+      Must begin with AmazonCloudWatch, max 128 chars, valid characters are 
+      a-z, A-Z, 0-9, and _, -, and . only 
+    MaxLength: 128
+    Default: AmazonCloudWatchASGUbuntuInstall
+Resources: 
+  CloudwatchConfigFileUbuntu: 
+    Type: AWS::SSM::Parameter
+    Properties: 
+      Name: !Ref SSMDocName
+      Type: String
+      Value: !Sub |    
+        {
+          "agent": {
+            "metrics_collection_interval": 10,
+            "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+          },
+          "metrics": {
+            "metrics_collected": {
+              "cpu": {
+                "resources": [ "*" ],
+                "measurement": [
+                  {"name": "cpu_usage_idle", "rename": "CPU_USAGE_IDLE", "unit": "Percent"},
+                  {"name": "cpu_usage_nice", "unit": "Percent"},
+                  "cpu_usage_guest"
+                ],
+                "totalcpu": false,
+                "metrics_collection_interval": 10
+              },
+              "disk": {
+                "measurement": [
+                  {"name": "free", "rename": "DISK_FREE", "unit": "Gigabytes"},
+                  "total",
+                  "used"
+                ],
+                "metrics_collection_interval": 60
+              },
+              "mem": {
+                "measurement": [
+                  "mem_used",
+                  "mem_cached",
+                  "mem_total"
+                ],
+                "metrics_collection_interval": 10
+              }
+            },
+            "append_dimensions": {
+              "ImageId": "{aws:ImageId}",
+              "InstanceId": "{aws:InstanceId}",
+              "InstanceType": "{aws:InstanceType}",
+              "AutoScalingGroupName": "{aws:AutoScalingGroupName}"
+            },            
+          },
+          "logs": {   
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log",
+                    "timezone": "Local"
+                  },
+                  {
+                    "file_path": "/var/log/syslog",
+                    "timezone": "Local"
+                  }
+                ]
+              }
+            },
+            "log_group_name": "/ec2/{aws:AutoScalingGroupName}"
+            "log_stream_name": "{instance_id}"
+          }
+        }
+                 
+       
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: ASGCloudWatchInStallUbuntu
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement: 
+        - Effect: Allow
+          Principal: 
+            Service: 
+            - lambda.amazonaws.com
+          Action: 
+            - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: !Ref AWS::StackName
+        PolicyDocument: 
+          Version: 2012-10-17
+          Statement: 
+          - Effect: Allow
+            Action: 
+              - ssm:ListCommandInvocations
+            Resource: '*'
+          - Effect: Allow 
+            Action: ssm:GetParameter
+            Resource: 
+            - !Join
+                - ""
+                - - "arn:aws:ssm:*:*:parameter/Doc_"
+                  - !Ref SSMDocName
+          - Effect: Allow
+            Action: ssm:SendCommand
+            Resource:
+              - arn:aws:ec2:*:*:instance/*
+              - arn:aws:ssm:*:*:managed-instance/*
+              - !Join
+                  - ""
+                  - - "arn:aws:ssm:*:*:document/Doc_"
+                    - !Ref SSMDocName              
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  CloudWatchInstallLambda:
+    Type: AWS::Lambda::Function
+    Properties: 
+      FunctionName: CloudWatchInstallAndConfig
+      Runtime: python3.8
+      Timeout: 500
+      Handler: index.handler
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Code: 
+        ZipFile: 
+          !Sub
+            - |-
+              #!/usr/bin/env python3
+              import logging
+              import traceback
+              import boto3
+              import botocore
+              import time
+             
+              LOGGER=logging.getLogger()
+              LOGGER.setLevel(logging.INFO)
+             
+              def handler(event, context):              
+                detail = event['detail']
+                LOGGER.info(detail)
+                instance_id = event['detail']['EC2InstanceId']
+                instance_ids = []
+                instance_ids.append(instance_id)
+                ## sleep a little to give SSM Agent time to startup 
+                LOGGER.info("Working on instance: %s" % instance_id)
+                time.sleep(20) 
+                ssm_client = boto3.client('ssm')
+                ready = False
+                ### Because a Document name cannot start with Amazon
+                docname = "Doc_${SSMDocName}"
+                LOGGER.info("docname set to: %s" % docname)
+                                      
+                while ready != True: 
+                  try: 
+                    resp=ssm_client.send_command(InstanceIds=instance_ids, DocumentName=docname)
+                    ready=True
+                  except botocore.exceptions.ClientError as e:
+                    LOGGER.error(e)
+                    ec = e.response['Error']['Code']
+                    if ec == "InvalidInstanceId":
+                      LOGGER.error("Instance %s not ready to receive commands yet. Sleep then try again" % instance_id)
+                      time.sleep(15)
+                    else:
+                      raise e
+                LOGGER.info(resp)      
+                command_id = resp['Command']['CommandId']
+                status = resp['Command']['Status']
+                
+                while status != "Success":
+                  resp = ssm_client.list_command_invocations(CommandId=command_id, InstanceId=instance_id)
+                  cmd = resp['CommandInvocations']
+                  if cmd: 
+                    status = resp['CommandInvocations'][0]['Status']
+                    if status ==  "Failed": 
+                      LOGGER.error(resp)
+                  else:
+                    LOGGER.info("No status available yet")
+                  time.sleep(15)
+ 
+            -  lambda_function_role_arn: !Ref LambdaFunctionRole
+  ASGScaleOutRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Rule that triggers lambda on ASG scale out"
+      EventPattern:
+        source: ['aws.autoscaling']
+        detail-type: ['EC2 Instance Launch Successful']
+        detail: 
+          AutoScalingGroupName:
+            !Ref AutoScalingGroupNames
+      State: "ENABLED"
+      Targets: 
+        - 
+           Arn: !GetAtt CloudWatchInstallLambda.Arn
+           Id: CloudWatchInstallLambda
+  CWLambdaInvokePerms: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt CloudWatchInstallLambda.Arn
+      Action: lambda:invokeFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ASGScaleOutRule.Arn   
+  CWInstallUbuntuDocument:
+    Type: AWS::SSM::Document
+    Properties: 
+      Name: 
+        !Join
+          - ''
+          - - "Doc_"
+            - !Ref SSMDocName
+      DocumentType: Command
+      Content: 
+        schemaVersion: '2.2'
+        description: "Install and Configure CloudWatch on EC2 Ubuntu Instance"
+        parameters: 
+          configFile:  
+            description: "CloudWatch Config File imported from Parameter Store"
+            type: String
+            default: !Ref SSMDocName
+        mainSteps:
+        - name: InstallCloudWatchAgent
+          action: aws:runShellScript
+          inputs: 
+            timeoutSeconds: 60
+            runCommand: 
+              - echo "downloading agent"
+              - curl -o /var/tmp/amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/debian/amd64/latest/amazon-cloudwatch-agent.deb
+              - echo "installing agent"
+              - sudo dpkg -i -E /var/tmp/amazon-cloudwatch-agent.deb
+              - echo "starting agent"
+              - !Sub 'sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:${SSMDocName}'
+              - echo "done"               
+          precondition: 
+            StringEquals: 
+            - platformType
+            - Linux
